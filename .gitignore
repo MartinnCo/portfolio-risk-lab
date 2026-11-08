@@ -1,0 +1,17 @@
+# Môi trường
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# Dữ liệu — KHÔNG BAO GIỜ commit (dữ liệu nằm ở $RISKLAB_DATA, ngoài repo; các dòng dưới là lưới an toàn)
+risklab-data/
+data/
+*.parquet
+*.csv
+*.db
+*.sqlite
+*.avro
+mc_runs/
+exports/
