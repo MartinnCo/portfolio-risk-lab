@@ -152,13 +152,206 @@ PORTFOLIO_WEIGHTS_S = TableSpec(
     serves=("Q1", "Q2", "Q3", "Q5"),
 )
 
-# Ý nghĩa: Danh sách mọi bảng đã thiết kế. Gold sẽ thêm ở Buổi 5.
+# ---------------------------------------------------------------- GOLD
+# Ý nghĩa: Gold = bảng kết quả, tổ chức THEO CÂU HỎI NGHIỆP VỤ (không theo nguồn).
+# Quy ước chung của gold:
+#   - VaR/ES lưu là SỐ DƯƠNG, tính bằng phần của giá trị danh mục (0.087 = lỗ 8,7%).
+#   - Mức tin cậy và phân vị lưu số nguyên basis point (9500, 9750, 9900), KHÔNG double,
+#     vì so sánh bằng trên số thực có thể sai ngầm (0.1 + 0.2 != 0.3).
+#   - batch_id = batch raw mà dòng được tính ra từ đó (sợi dây lineage về raw);
+#     source_system = "risklab" (do risk engine tính, không đến từ nguồn ngoài).
+
+# Ý nghĩa: Các giá trị hợp lệ cho cột phân loại của gold (pipeline sẽ kiểm tra khi ghi).
+VAR_METHODS = ("historical", "parametric", "mc_normal", "mc_t", "mc_bootstrap")
+CONFIDENCE_BP = (9500, 9750, 9900)      # 97,5% là mức Expected Shortfall dùng trong FRTB
+HORIZON_DAYS = (1, 21)
+SCENARIO_TYPES = ("historical", "hypothetical")
+
+# Ý nghĩa: Khóa chung của "một con số VaR": dùng lại ở 3 bảng để join 1:1 không lệch.
+VAR_KEY = ("portfolio_id", "as_of_date", "method", "confidence_bp", "horizon_days", "window_days")
+
+
+# Ý nghĩa: Các cột khóa của VAR_KEY, viết một lần, dùng lại cho các bảng có cùng khóa.
+def var_key_columns() -> tuple[Column, ...]:
+    return (
+        Column("portfolio_id", "string", True, "Portfolio code, e.g. ew7"),
+        Column("as_of_date", "date", True,
+               "Date the estimate is made; only data dated <= as_of_date may be used (no look-ahead)"),
+        Column("method", "string", True, "historical | parametric | mc_normal | mc_t | mc_bootstrap"),
+        Column("confidence_bp", "int", True, "Confidence level in basis points: 9500, 9750, 9900"),
+        Column("horizon_days", "int", True, "Holding horizon in trading days: 1 or 21"),
+        Column("window_days", "int", True, "Number of trading days of history used to estimate the model"),
+    )
+
+
+# Ý nghĩa: Lợi nhuận ngày của cả danh mục = tổng (trọng số x simple return từng mã).
+# Bảng nền cho mọi bảng gold khác. Cộng theo tài sản phải dùng simple return.
+PORTFOLIO_RETURNS_G = TableSpec(
+    namespace="gold",
+    name="portfolio_returns_g",
+    description="Daily portfolio returns: weighted sum of asset simple returns, using the weights valid on each date.",
+    grain="1 row = 1 portfolio x 1 trading date",
+    key=("portfolio_id", "trade_date"),
+    columns=(
+        Column("portfolio_id", "string", True, "Portfolio code, e.g. ew7"),
+        Column("trade_date", "date", True, "Trading date of the return"),
+        Column("simple_return", "double", True, "Sum over tickers of weight x simple_return (simple returns add across assets)"),
+        Column("log_return", "double", True, "ln(1 + simple_return); use to add across time"),
+        Column("n_assets", "int", True, "Number of tickers with a return on this date; less than expected means missing data"),
+        Column("weights_valid_from", "date", True, "valid_from of the weight version used (trace to portfolio_weights_s)"),
+    ) + tech_columns(),
+    serves=("Q1", "Q2", "Q5"),
+)
+
+# Ý nghĩa: Mọi con số VaR/ES, mỗi dòng ghi đủ "tính ngày nào, cách nào, mức tin cậy nào,
+# horizon nào, dùng bao nhiêu dữ liệu". window_end để kiểm toán look-ahead bias.
+VAR_ESTIMATES_G = TableSpec(
+    namespace="gold",
+    name="var_estimates_g",
+    description="VaR and Expected Shortfall estimates by method, confidence, horizon and estimation window.",
+    grain="1 row = 1 portfolio x as_of_date x method x confidence x horizon x window",
+    key=VAR_KEY,
+    columns=var_key_columns() + (
+        Column("window_start", "date", True, "First return date in the estimation window"),
+        Column("window_end", "date", True, "Last return date in the estimation window; must be <= as_of_date"),
+        Column("n_obs", "int", True, "Number of daily returns actually used"),
+        Column("var_pct", "double", True, "Value at Risk as a positive fraction of portfolio value (0.087 = 8.7% loss)"),
+        Column("es_pct", "double", True, "Expected Shortfall (CVaR): mean loss beyond VaR, positive fraction"),
+        Column("run_id", "string", False, "Monte Carlo run folder in mc_runs; null for historical and parametric"),
+        Column("seed", "long", False, "Random seed of the Monte Carlo run; null for non-simulation methods"),
+        Column("n_paths", "int", False, "Number of simulated paths; null for non-simulation methods"),
+    ) + tech_columns(),
+    serves=("Q1", "Q4"),
+)
+
+# Ý nghĩa: Tóm tắt path Monte Carlo bằng phân vị theo từng ngày (để vẽ fan chart).
+# KHÔNG lưu toàn bộ path ở gold: path đầy đủ nằm trong mc_runs/run_id=... kèm manifest.
+MC_PATHS_SUMMARY_G = TableSpec(
+    namespace="gold",
+    name="mc_paths_summary_g",
+    description="Quantiles of simulated cumulative portfolio return per day step of one Monte Carlo run (full paths stay in mc_runs).",
+    grain="1 row = 1 Monte Carlo run x 1 day step x 1 quantile",
+    key=("run_id", "step", "quantile_bp"),
+    columns=(
+        Column("run_id", "string", True, "Monte Carlo run folder in mc_runs"),
+        Column("step", "int", True, "Trading days after as_of_date: 0 .. horizon_days"),
+        Column("quantile_bp", "int", True, "Quantile in basis points, e.g. 100 = 1st percentile, 5000 = median"),
+        Column("portfolio_id", "string", True, "Portfolio code"),
+        Column("as_of_date", "date", True, "Start date of the simulation"),
+        Column("method", "string", True, "mc_normal | mc_t | mc_bootstrap"),
+        Column("cum_return", "double", True, "Cumulative simple portfolio return from as_of_date to this step, at this quantile"),
+        Column("seed", "long", True, "Random seed of the run"),
+        Column("n_paths", "int", True, "Number of simulated paths"),
+    ) + tech_columns(),
+    serves=("Q1",),
+)
+
+# Ý nghĩa: Backtest từng ngày: VaR dự báo hôm đó so với lãi/lỗ thực tế sau đó.
+# Cùng khóa với var_estimates_g (1:1). Đây là bảng DUY NHẤT được đọc return sau as_of_date.
+VAR_BACKTEST_G = TableSpec(
+    namespace="gold",
+    name="var_backtest_g",
+    description="Each VaR estimate compared with the realised portfolio return over its horizon.",
+    grain="1 row = 1 portfolio x as_of_date x method x confidence x horizon x window (1:1 with var_estimates_g)",
+    key=VAR_KEY,
+    columns=var_key_columns() + (
+        Column("var_pct", "double", True, "VaR copied from var_estimates_g, positive fraction"),
+        Column("realized_end_date", "date", True, "Last date of the realised window (horizon_days trading days after as_of_date)"),
+        Column("realized_return", "double", True, "Realised cumulative simple portfolio return from as_of_date to realized_end_date"),
+        Column("is_violation", "boolean", True, "True when realized_return < -var_pct (loss larger than VaR)"),
+    ) + tech_columns(),
+    serves=("Q2",),
+)
+
+# Ý nghĩa: Bảng KẾT LUẬN cho Q2: đếm vi phạm và kiểm định thống kê theo từng phương pháp.
+# Christoffersen để null với horizon 21 (cửa sổ chồng lấn làm kiểm định độc lập sai).
+VAR_TEST_RESULTS_G = TableSpec(
+    namespace="gold",
+    name="var_test_results_g",
+    description="Backtest statistics per method: violation counts, Kupiec POF and Christoffersen independence tests.",
+    grain="1 row = 1 portfolio x method x confidence x horizon x window x test period",
+    key=("portfolio_id", "method", "confidence_bp", "horizon_days", "window_days", "test_start", "test_end"),
+    columns=(
+        Column("portfolio_id", "string", True, "Portfolio code"),
+        Column("method", "string", True, "historical | parametric | mc_normal | mc_t | mc_bootstrap"),
+        Column("confidence_bp", "int", True, "Confidence level in basis points"),
+        Column("horizon_days", "int", True, "Holding horizon in trading days"),
+        Column("window_days", "int", True, "Estimation window in trading days"),
+        Column("test_start", "date", True, "First as_of_date in the test period"),
+        Column("test_end", "date", True, "Last as_of_date in the test period"),
+        Column("n_obs", "int", True, "Number of backtest rows tested"),
+        Column("n_violations", "int", True, "Number of rows with is_violation = true"),
+        Column("expected_violations", "double", True, "n_obs x (1 - confidence)"),
+        Column("violation_rate", "double", True, "n_violations / n_obs"),
+        Column("kupiec_lr", "double", False, "Kupiec proportion-of-failures likelihood ratio"),
+        Column("kupiec_pvalue", "double", False, "p-value of the Kupiec test; small = violation rate is wrong"),
+        Column("christoffersen_lr", "double", False, "Christoffersen independence likelihood ratio; null for overlapping horizons"),
+        Column("christoffersen_pvalue", "double", False, "p-value of the Christoffersen test; small = violations cluster"),
+    ) + tech_columns(),
+    serves=("Q2", "Q4"),
+)
+
+# Ý nghĩa: VaR được chia cho từng mã (như chia hóa đơn theo ai gọi nhiều món).
+# Tổng component_var_pct của các mã = var_pct của danh mục (pipeline kiểm tra).
+RISK_CONTRIBUTION_G = TableSpec(
+    namespace="gold",
+    name="risk_contribution_g",
+    description="Component VaR per ticker; contributions add up to the portfolio VaR in var_estimates_g.",
+    grain="1 row = 1 portfolio x as_of_date x method x confidence x horizon x window x ticker",
+    key=VAR_KEY + ("ticker",),
+    columns=var_key_columns() + (
+        Column("ticker", "string", True, "Exchange symbol"),
+        Column("weight", "double", True, "Portfolio weight of the ticker on as_of_date"),
+        Column("component_var_pct", "double", True, "Share of portfolio VaR due to this ticker, fraction of portfolio value"),
+        Column("pct_of_total", "double", True, "component_var_pct / portfolio var_pct; sums to 1 over tickers"),
+    ) + tech_columns(),
+    serves=("Q3",),
+)
+
+# Ý nghĩa: Kịch bản căng thẳng. historical = chạy lại khủng hoảng thật (2020, 2022);
+# hypothetical = tự đặt tương quan cao hơn (corr_override). Cột không áp dụng để null.
+STRESS_SCENARIOS_G = TableSpec(
+    namespace="gold",
+    name="stress_scenarios_g",
+    description="Stress test results: historical crisis replays and hypothetical correlation shocks.",
+    grain="1 row = 1 scenario x 1 portfolio",
+    key=("scenario_id", "portfolio_id"),
+    columns=(
+        Column("scenario_id", "string", True, "Scenario code, e.g. covid_2020, rates_2022, corr_080"),
+        Column("portfolio_id", "string", True, "Portfolio code"),
+        Column("scenario_type", "string", True, "historical | hypothetical"),
+        Column("description", "string", True, "What the scenario assumes, in one sentence"),
+        Column("start_date", "date", False, "First date of a historical window; null for hypothetical"),
+        Column("end_date", "date", False, "Last date of a historical window; null for hypothetical"),
+        Column("portfolio_return", "double", False, "Cumulative simple return over the historical window"),
+        Column("max_drawdown", "double", False, "Largest peak-to-trough fall in the window, positive fraction"),
+        Column("worst_day_return", "double", False, "Worst single-day portfolio return in the window"),
+        Column("corr_override", "double", False, "Pairwise correlation imposed in a hypothetical scenario, e.g. 0.8"),
+        Column("confidence_bp", "int", False, "Confidence of the stressed VaR, basis points"),
+        Column("horizon_days", "int", False, "Horizon of the stressed VaR, trading days"),
+        Column("base_var_pct", "double", False, "VaR without the shock, same confidence and horizon"),
+        Column("stressed_var_pct", "double", False, "VaR under the shock; stressed / base = amplification"),
+    ) + tech_columns(),
+    serves=("Q3", "Q5"),
+)
+
+GOLD_TABLES: tuple[TableSpec, ...] = (
+    PORTFOLIO_RETURNS_G,
+    VAR_ESTIMATES_G,
+    MC_PATHS_SUMMARY_G,
+    VAR_BACKTEST_G,
+    VAR_TEST_RESULTS_G,
+    RISK_CONTRIBUTION_G,
+    STRESS_SCENARIOS_G,
+)
+
+# Ý nghĩa: Danh sách mọi bảng đã thiết kế (bronze, silver ở Buổi 4; gold ở Buổi 5).
 TABLES: tuple[TableSpec, ...] = (
     PRICES_DAILY_B,
     RETURNS_DAILY_S,
     INSTRUMENTS_S,
     PORTFOLIO_WEIGHTS_S,
-)
+) + GOLD_TABLES
 
 
 # Ý nghĩa: Sinh data dictionary dạng Markdown từ TABLES, để tài liệu không bao giờ
@@ -202,4 +395,52 @@ def render_data_dictionary(tables: tuple[TableSpec, ...] = TABLES) -> str:
             lines.append(
                 f"| {i} | `{c.name}`{key_mark} | {c.type} | {'yes' if c.required else 'no'} | {c.doc} |"
             )
+    return "\n".join(lines) + "\n"
+
+
+# Ý nghĩa: Truy vết hai chiều giữa câu hỏi nghiệp vụ và bảng gold.
+# Chiều xuôi: câu hỏi nào chưa có bảng gold trả lời. Chiều ngược: bảng gold nào
+# không phục vụ câu nào. Cả hai danh sách phải rỗng (unit test kiểm tra).
+def traceability_gaps(tables: tuple[TableSpec, ...] = TABLES) -> dict[str, list[str]]:
+    gold = [t for t in tables if t.namespace == "gold"]
+    served = {q for t in gold for q in t.serves}
+    return {
+        "questions_without_gold": [q for q in BUSINESS_QUESTIONS if q not in served],
+        "gold_without_question": [t.identifier for t in gold
+                                  if not set(t.serves) & set(BUSINESS_QUESTIONS)],
+    }
+
+
+# Ý nghĩa: Sinh docs/traceability.md: ma trận câu hỏi x bảng (x = bảng phục vụ câu đó),
+# cho mọi tầng, kèm kết quả kiểm tra truy vết hai chiều.
+def render_traceability(tables: tuple[TableSpec, ...] = TABLES) -> str:
+    qids = list(BUSINESS_QUESTIONS)
+    lines = [
+        "# Traceability: business questions to tables",
+        "",
+        "Generated from `src/portfolio_risk_lab/schemas.py` by `scripts/render_traceability.py`. "
+        "Do not edit by hand: change `serves` in the spec and regenerate.",
+        "",
+        "An `x` means the table helps answer the question. Which table is primary for each "
+        "question is explained in [`layers.md`](layers.md).",
+        "",
+        "## Business questions",
+        "",
+        "| Id | Question |",
+        "|---|---|",
+    ]
+    lines += [f"| {q} | {text} |" for q, text in BUSINESS_QUESTIONS.items()]
+    lines += ["", "## Matrix", "", "| Table | " + " | ".join(qids) + " |",
+              "|---|" + "---|" * len(qids)]
+    for t in tables:
+        marks = ["x" if q in t.serves else "" for q in qids]
+        lines.append(f"| `{t.identifier}` | " + " | ".join(marks) + " |")
+    gaps = traceability_gaps(tables)
+    lines += ["", "## Checks", ""]
+    lines.append("- Every question has at least one gold table: "
+                 + ("yes" if not gaps["questions_without_gold"]
+                    else "NO, missing " + ", ".join(gaps["questions_without_gold"])))
+    lines.append("- Every gold table serves at least one question: "
+                 + ("yes" if not gaps["gold_without_question"]
+                    else "NO, orphan " + ", ".join(gaps["gold_without_question"])))
     return "\n".join(lines) + "\n"
